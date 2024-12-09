@@ -1,0 +1,9 @@
+README.md
+/home/bruce/ros-ngimu/src/Fusion-main/Fusion/FusionAhrs.c
+/home/bruce/ros-ngimu/src/Fusion-main/Fusion/FusionCompass.c
+/home/bruce/ros-ngimu/src/Fusion-main/Fusion/FusionOffset.c
+/home/bruce/ros-ngimu/src/Fusion-main/Python/Python-C-API/imufusion.c
+imufusion.egg-info/PKG-INFO
+imufusion.egg-info/SOURCES.txt
+imufusion.egg-info/dependency_links.txt
+imufusion.egg-info/top_level.txt

@@ -41,7 +41,6 @@
 
 #include "imu_calib/apply_calib.h"
 #include <unistd.h>
-
 namespace imu_calib
 {
 
@@ -56,20 +55,12 @@ ApplyCalib::ApplyCalib() :
 
   std::string calib_file;
   nh_private.param<std::string>("calib_file", calib_file, "imu_calib.yaml");
-
-    char *cwd;
-
-    char wd[BUFSIZ];
-
- 
-
-    cwd = getcwd(NULL, BUFSIZ);
-
-    printf("1.Current Directory : %s\n", cwd);
-
-
-
-
+  
+  char *cwd;
+  char wd[BUFSIZ];
+  cwd = getcwd(NULL, BUFSIZ);
+  printf("1.Current Directory : %s\n", cwd);
+  
   if (!calib_.loadCalib(calib_file) || !calib_.calibReady())
   {
     ROS_FATAL("Calibration could not be loaded");

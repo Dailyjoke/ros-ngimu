@@ -25,11 +25,15 @@
 #include "imu_filter_madgwick/imu_filter_ros.h"
 #include "imu_filter_madgwick/stateless_orientation.h"
 #include "geometry_msgs/TransformStamped.h"
+#include "geometry_msgs/PoseStamped.h"
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
 
 ImuFilterRos::ImuFilterRos(ros::NodeHandle nh, ros::NodeHandle nh_private)
-    : nh_(nh), nh_private_(nh_private), initialized_(false)
+    : nh_(nh),
+      nh_private_(nh_private),
+      initialized_(false),
+      tf_listener_(tf_buffer_)
 {
     ROS_INFO("Starting ImuFilter");
 
@@ -39,15 +43,19 @@ ImuFilterRos::ImuFilterRos(ros::NodeHandle nh, ros::NodeHandle nh_private)
     if (!nh_private_.getParam("publish_tf", publish_tf_)) publish_tf_ = true;
     if (!nh_private_.getParam("reverse_tf", reverse_tf_)) reverse_tf_ = false;
     if (!nh_private_.getParam("fixed_frame", fixed_frame_))
-        fixed_frame_ = "world";
+        fixed_frame_ = "odom";
     if (!nh_private_.getParam("constant_dt", constant_dt_)) constant_dt_ = 0.0;
     if (!nh_private_.getParam("remove_gravity_vector", remove_gravity_vector_))
         remove_gravity_vector_ = false;
     if (!nh_private_.getParam("publish_debug_topics", publish_debug_topics_))
         publish_debug_topics_ = false;
+    double time_jump_threshold{0.0};
+    nh_private_.param("time_jump_threshold", time_jump_threshold,
+                      time_jump_threshold);
+    time_jump_threshold_ = ros::Duration(time_jump_threshold);
 
     double yaw_offset = 0.0;
-    if (!nh_private_.getParam("yaw_offset", yaw_offset)) yaw_offset = -0.785 * 2; //0.0;
+    if (!nh_private_.getParam("yaw_offset", yaw_offset)) yaw_offset = 0.0;
     double declination = 0.0;
     if (!nh_private_.getParam("declination", declination)) declination = 0.0;
     // create yaw offset quaternion
@@ -97,6 +105,8 @@ ImuFilterRos::ImuFilterRos(ros::NodeHandle nh, ros::NodeHandle nh_private)
     else
         ROS_INFO("The gravity vector is kept in the IMU message.");
 
+    last_ros_time_ = ros::Time::now();
+
     // **** register dynamic reconfigure
     config_server_.reset(new FilterConfigServer(nh_private_));
     FilterConfigServer::CallbackType f =
@@ -115,6 +125,10 @@ ImuFilterRos::ImuFilterRos(ros::NodeHandle nh, ros::NodeHandle nh_private)
 
         rpy_raw_debug_publisher_ = nh_.advertise<geometry_msgs::Vector3Stamped>(
             ros::names::resolve("imu") + "/rpy/raw", 5);
+
+        orientation_filtered_publisher_ =
+            nh_private.advertise<geometry_msgs::PoseStamped>(
+                ros::names::resolve("imu") + "/orientation_filtered", 5);
     }
 
     // **** register subscribers
@@ -124,8 +138,6 @@ ImuFilterRos::ImuFilterRos(ros::NodeHandle nh, ros::NodeHandle nh_private)
 
     imu_subscriber_.reset(new ImuSubscriber(
         nh_, ros::names::resolve("imu") + "/data_raw", queue_size));
-        // nh_, ros::names::resolve("imu") + "/clib", queue_size));
-
 
     if (use_mag_)
     {
@@ -155,6 +167,8 @@ ImuFilterRos::~ImuFilterRos()
 
 void ImuFilterRos::imuCallback(const ImuMsg::ConstPtr& imu_msg_raw)
 {
+    checkTimeJump();
+
     boost::mutex::scoped_lock lock(mutex_);
 
     const geometry_msgs::Vector3& ang_vel = imu_msg_raw->angular_velocity;
@@ -215,6 +229,8 @@ void ImuFilterRos::imuCallback(const ImuMsg::ConstPtr& imu_msg_raw)
 void ImuFilterRos::imuMagCallback(const ImuMsg::ConstPtr& imu_msg_raw,
                                   const MagMsg::ConstPtr& mag_msg)
 {
+    checkTimeJump();
+
     boost::mutex::scoped_lock lock(mutex_);
 
     const geometry_msgs::Vector3& ang_vel = imu_msg_raw->angular_velocity;
@@ -399,7 +415,36 @@ void ImuFilterRos::publishFilteredMsg(const ImuMsg::ConstPtr& imu_msg_raw)
 
         rpy.header = imu_msg_raw->header;
         rpy_filtered_debug_publisher_.publish(rpy);
+
+        publishOrientationFiltered(imu_msg);
     }
+}
+
+void ImuFilterRos::publishOrientationFiltered(const ImuMsg::ConstPtr& imu_msg)
+{
+    geometry_msgs::PoseStamped pose_msg;
+    pose_msg.header.stamp = imu_msg->header.stamp;
+    pose_msg.header.frame_id = fixed_frame_;
+    pose_msg.pose.orientation = imu_msg->orientation;
+
+    // get the current transform from the fixed frame to the imu frame
+    geometry_msgs::TransformStamped transform;
+    try
+    {
+        transform = tf_buffer_.lookupTransform(
+            fixed_frame_, imu_msg->header.frame_id, imu_msg->header.stamp,
+            ros::Duration(0.1));
+    } catch (tf2::TransformException& ex)
+    {
+        ROS_WARN("%s", ex.what());
+        return;
+    }
+
+    pose_msg.pose.position.x = transform.transform.translation.x;
+    pose_msg.pose.position.y = transform.transform.translation.y;
+    pose_msg.pose.position.z = transform.transform.translation.z;
+
+    orientation_filtered_publisher_.publish(pose_msg);
 }
 
 void ImuFilterRos::publishRawMsg(const ros::Time& t, float roll, float pitch,
@@ -437,11 +482,38 @@ void ImuFilterRos::checkTopicsTimerCallback(const ros::TimerEvent&)
 {
     if (use_mag_)
         ROS_WARN_STREAM("Still waiting for data on topics "
-                        << ros::names::resolve("imu") << "/data_raw"
-                        << " and " << ros::names::resolve("imu") << "/mag"
-                        << "...");
+                        << imu_subscriber_->getTopic() << " and "
+                        << mag_subscriber_->getTopic() << "...");
     else
         ROS_WARN_STREAM("Still waiting for data on topic "
-                        << ros::names::resolve("imu") << "/data_raw"
-                        << "...");
+                        << imu_subscriber_->getTopic() << "...");
+}
+
+void ImuFilterRos::reset()
+{
+    boost::mutex::scoped_lock lock(mutex_);
+    filter_.reset();
+    initialized_ = false;
+    last_time_ = {};
+    last_ros_time_ = ros::Time::now();
+}
+
+void ImuFilterRos::checkTimeJump()
+{
+    const auto now = ros::Time::now();
+    if (last_ros_time_.isZero() || last_ros_time_ <= now + time_jump_threshold_)
+    {
+        last_ros_time_ = now;
+        return;
+    }
+
+    ROS_WARN("Detected jump back in time of %.1f s. Resetting IMU filter.",
+             (last_ros_time_ - now).toSec());
+
+    if (time_jump_threshold_.isZero() && ros::Time::isSystemTime())
+        ROS_INFO(
+            "To ignore short time jumps back, use ~time_jump_threshold "
+            "parameter of the filter.");
+
+    reset();
 }
